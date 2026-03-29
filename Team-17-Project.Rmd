@@ -1,0 +1,815 @@
+---
+title: 'DS 520Q Team 17: Ames House Project'
+author: "Team 17: Arya Pedneka, Dawit Yang, Iris Zhang, Shreya Nair, Yanqing Xu"
+date: "2025-09-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+# Load necessary libraries
+library(ggplot2)     # For data visualization
+library(car)         # For Q-Q plots
+library(ggcorrplot)  # For heatmaps
+library(dplyr)       # For data manipulation (equivalent to pandas)
+library(tidyr)       # For data tidying
+library(scales)      # For formatting numerical outputs
+library(readr)       # For reading CSV files
+
+# Suppress warnings
+options(warn = -1) 
+
+# Libraries for statistical analysis
+library(MASS)     # Includes functions for normal distribution fitting
+library(stats)    # Base statistics package
+library(ggpubr)   # For adding statistical annotations to plots
+library(Metrics)  # For RMSLE calculation
+
+# Set global float format to 3 decimal points
+options(digits = 3)
+```
+
+
+## Introduction
+
+```{r}
+# Import train and test datasets
+train <- read.csv("train.csv")
+test <- read.csv("test.csv")
+
+# Extract the target variable 'SalePrice' from the test dataset
+y_test <-test$SalePrice
+
+# Verify the structure of the datasets
+str(train)
+str(test)
+```
+
+Check the first 5 rows of the train data
+
+```{r}
+head(train, 5)
+```
+
+Check the first 5 rows of the test data
+
+```{r}
+head(test, 5)
+```
+
+```{r}
+# Check the number of samples and features before dropping the 'Id' column
+cat("The train data size before dropping Id feature is:", dim(train), "\n")
+cat("The test data size before dropping Id feature is:", dim(test), "\n")
+
+# Save the 'Id' column
+train_ID <- train$Id
+test_ID <- test$Id
+
+# Drop the 'Id' column since it's unnecessary for the prediction process
+train <- train[, !(names(train) %in% c("Id"))]
+test <- test[, !(names(test) %in% c("Id"))]
+
+# Check the number of samples and features after dropping the 'Id' column
+cat("\nThe train data size after dropping Id feature is:", dim(train), "\n")
+cat("The test data size after dropping Id feature is:", dim(test), "\n")
+
+```
+
+## Data Processing
+
+### Outliers
+
+```{r}
+# Create a scatter plot
+ggplot(data = train, aes(x = GrLivArea, y = SalePrice)) +
+  geom_point() +  # Add scatter points
+  labs(x = "GrLivArea", y = "SalePrice") +  # Add axis labels
+  theme_minimal(base_size = 13)  # Set font size and minimal theme
+
+```
+
+At the bottom right, we notice two data points with exceptionally large GrLivArea but surprisingly low prices. These points are significant outliers and can be reasonably removed from the dataset.
+
+```{r}
+# Deleting outliers
+train <- train[!(train$GrLivArea > 4000 & train$SalePrice < 300000), ]
+
+# Check the graphic again
+library(ggplot2)
+ggplot(data = train, aes(x = GrLivArea, y = SalePrice)) +
+  geom_point() +
+  labs(x = "GrLivArea", y = "SalePrice") +
+  theme_minimal(base_size = 13)
+
+```
+
+### Target Varialble
+
+Our target variable is **SalePrice**.
+
+```{r}
+# Fit the normal distribution to 'SalePrice'
+mu <- mean(train$SalePrice)  # Mean
+sigma <- sd(train$SalePrice) # Standard deviation
+cat("\nmu =", round(mu, 2), "and sigma =", round(sigma, 2), "\n")
+
+# Plot the distribution with the fitted normal curve
+ggplot(train, aes(x = SalePrice)) +
+  geom_histogram(aes(y = ..density..), bins = 30, color = "black", fill = "skyblue") +
+  stat_function(fun = dnorm, args = list(mean = mu, sd = sigma), 
+                color = "red", linewidth = 1) +
+  labs(title = "SalePrice Distribution", y = "Density", x = "SalePrice") +
+  theme_minimal() +
+  annotate("text", x = max(train$SalePrice) * 0.6, y = 0.00005, 
+           label = paste("Normal dist. (mu =", round(mu, 2), ", sigma =", round(sigma, 2), ")"), 
+           hjust = 0, size = 4)
+
+# Q-Q plot
+qqPlot(train$SalePrice, main = "Q-Q Plot of SalePrice", ylab = "Quantiles of SalePrice")
+```
+
+The target variable exhibits right skewness. Since (linear) models perform better with normally distributed data, we need to transform this variable to approximate a normal distribution.
+
+**Log-transformation of the target variable**
+
+```{r}
+#Duplicate one data set just for now
+df <- train
+
+# Apply the log1p transformation (log(1 + x)) to 'SalePrice'
+df$SalePrice <- log1p(df$SalePrice)
+
+# Check the new distribution
+library(ggplot2)
+mu <- mean(df$SalePrice)  # Calculate the mean
+sigma <- sd(df$SalePrice) # Calculate the standard deviation
+cat("\nmu =", round(mu, 2), "and sigma =", round(sigma, 2), "\n")
+
+# Plot the distribution with the fitted normal curve
+ggplot(df, aes(x = SalePrice)) +
+  geom_histogram(aes(y = ..density..), bins = 30, color = "black", fill = "skyblue") +
+  stat_function(fun = dnorm, args = list(mean = mu, sd = sigma), 
+                color = "red", linewidth = 1) +  # Use `linewidth` instead of `size`
+  labs(title = "SalePrice Distribution (Log Transformed)", 
+       y = "Density", x = "SalePrice (Log Transformed)") +
+  theme_minimal() +
+  annotate("text", x = max(df$SalePrice) * 0.8, y = 0.3, 
+           label = paste("Normal dist. (mu =", round(mu, 2), ", sigma =", round(sigma, 2), ")"), 
+           hjust = 0, size = 4)
+
+# Generate the Q-Q plot
+library(car)  # For Q-Q plots
+qqPlot(df$SalePrice, main = "Q-Q Plot of SalePrice (Log Transformed)", 
+       ylab = "Quantiles of SalePrice")
+```
+
+The skewness has been addressed, and the data now appears to follow a more normal distribution.
+
+### Features engineering
+
+Let's start by merging the train and test datasets into a single dataframe.
+
+```{r}
+# Record the number of rows in the train and test datasets
+ntrain <- nrow(train)
+ntest <- nrow(test)
+
+# Extract the target variable 'SalePrice' from the train dataset
+y_train <- train$SalePrice
+
+# Combine train and test datasets
+all_data <- rbind(train, test)
+
+# Remove the 'SalePrice' column from the combined dataset
+all_data <- all_data[, !names(all_data) %in% c("SalePrice")]
+
+# Display the size of the combined dataset
+cat("all_data size is:", dim(all_data), "\n")
+```
+
+**Missing data**
+
+```{r}
+# Calculate the percentage of missing values for each column
+all_data_na <- colSums(is.na(all_data)) / nrow(all_data) * 100
+
+# Filter columns with missing values and sort them in descending order
+all_data_na <- sort(all_data_na[all_data_na > 0], decreasing = TRUE)
+
+# Create a dataframe to display the missing ratio
+missing_data <- data.frame(Missing_Ratio = all_data_na)
+
+# Display the first 20 rows of the missing data
+head(missing_data, 20)
+
+```
+
+**Data Correlation**
+
+```{r}
+# Select only numeric columns from the train dataset
+numeric_train <- train[, sapply(train, is.numeric)]
+
+# Compute the correlation matrix
+corrmat <- cor(numeric_train, use = "pairwise.complete.obs")
+
+# Plot the heatmap
+ggcorrplot(corrmat, 
+           hc.order = TRUE,   # Hierarchical clustering order
+           type = "full",     # Show full matrix
+           lab = FALSE,       # Remove correlation coefficients from the heatmap
+           colors = c("blue", "white", "red"), # Color gradient
+           legend.title = "Correlation",
+           outline.color = "black") +
+  theme_minimal(base_size = 12) +
+  labs(title = "Correlation Heatmap", 
+       subtitle = "Feature Correlation with SalePrice")
+```
+
+The heatmap revealed strong correlations between certain predictors. For example, 'GarageCars' and 'GarageArea' showed high correlation, suggesting potential redundancy. 'TotalBsmtSF' and 'GrLivArea' were also highly correlated with each other and with 'SalePrice'.
+
+To identify key predictors for 'SalePrice', the correlation of numerical variables with the target variable was analyzed. Variables with the highest correlations including 'OverallQual','GrLivArea','GarageCars' and 'TotalBsmtSF'. These early indicators highlighted the importance of size and quality-related variables in predicting home prices.
+
+This findings suggested a combination of linear and nonlinear modeling approaches. Linear models could effectively capture the relationships between SalePrice and key predictors such as OverallQual and GrLivArea, especially after applying a log transformation to the target variable. Nonlinear models, such as decision trees and boosting algorithms, could handle complex interactions and nonlinear relationships among predictors.
+
+**Imputting missing values**
+
+We fill the missing values by addressing each feature sequentially.
+
+**PoolQC**: According to the data description, NA indicates "No Pool." This is logical considering the high percentage of missing values (over 99%) and the fact that most houses typically do not have a pool.
+
+```{r}
+# Replace NA values in the 'PoolQC' column with "None"
+all_data$PoolQC[is.na(all_data$PoolQC)] <- "None"
+```
+
+**MiscFeature**: As per the data description, NA signifies "no miscellaneous feature."
+
+```{r}
+# Replace NA values in the 'MiscFeature' column with "None"
+all_data$MiscFeature[is.na(all_data$MiscFeature)] <- "None"
+```
+
+**Alley**: According to the data description, NA indicates "no alley access."
+
+```{r}
+# Replace NA values in the 'Alley' column with "None"
+all_data$Alley[is.na(all_data$Alley)] <- "None"
+```
+
+**Fence**: As described in the data documentation, NA represents "no fence."
+
+```{r}
+# Replace NA values in the 'Fence' column with "None"
+all_data$Fence[is.na(all_data$Fence)] <- "None"
+```
+
+**FireplaceQu**: According to the data description, NA denotes "no fireplace."
+
+```{r}
+# Replace NA values in the 'FireplaceQu' column with "None"
+all_data$FireplaceQu[is.na(all_data$FireplaceQu)] <- "None"
+```
+
+**LotFrontage**: Since the area of each street connected to a house is likely similar to that of other houses in the same neighborhood, missing values can be filled using the median LotFrontage for the corresponding neighborhood.
+
+```{r}
+# Group by 'Neighborhood' and fill missing 'LotFrontage' with the median for each neighborhood
+all_data <- all_data %>%
+  group_by(Neighborhood) %>%
+  mutate(LotFrontage = ifelse(is.na(LotFrontage), median(LotFrontage, na.rm = TRUE), LotFrontage)) %>%
+  ungroup()
+```
+
+**GarageType, GarageFinish, GarageQual, and GarageCond**: Missing data is replaced with "None".
+
+```{r}
+# Replace NA values in the specified columns with "None"
+columns_to_replace <- c("GarageType", "GarageFinish", "GarageQual", "GarageCond")
+
+for (col in columns_to_replace) {
+  all_data[[col]][is.na(all_data[[col]])] <- "None"
+}
+```
+
+**GarageYrBlt, GarageArea, and GarageCars**: Missing data is replaced with 0, as the absence of a garage implies no cars or related features.
+
+```{r}
+# Replace NA values in the specified columns with 0
+columns_to_replace <- c("GarageYrBlt", "GarageArea", "GarageCars")
+
+for (col in columns_to_replace) {
+  all_data[[col]][is.na(all_data[[col]])] <- 0
+}
+```
+
+**BsmtFinSF1, BsmtFinSF2, BsmtUnfSF, TotalBsmtSF, BsmtFullBath, and BsmtHalfBath**: Missing values are assumed to be zero, indicating the absence of a basement.
+
+```{r}
+# Replace NA values in the specified columns with 0
+columns_to_replace <- c('BsmtFinSF1', 'BsmtFinSF2', 'BsmtUnfSF', 'TotalBsmtSF', 'BsmtFullBath', 'BsmtHalfBath')
+
+for (col in columns_to_replace) {
+  all_data[[col]][is.na(all_data[[col]])] <- 0
+}
+```
+
+**BsmtQual, BsmtCond, BsmtExposure, BsmtFinType1, and BsmtFinType2**: For these categorical basement-related features, NaN indicates the absence of a basement.
+
+```{r}
+# Replace NA values in the specified columns with "None"
+columns_to_replace <- c('BsmtQual', 'BsmtCond', 'BsmtExposure', 'BsmtFinType1', 'BsmtFinType2')
+
+for (col in columns_to_replace) {
+  all_data[[col]][is.na(all_data[[col]])] <- "None"
+}
+```
+
+**MasVnrArea and MasVnrType**: NA likely indicates the absence of a masonry veneer in these houses. We can fill 0 for the area and "None" for the type.
+
+```{r}
+# Replace NA values in 'MasVnrType' with "None" and in 'MasVnrArea' with 0
+all_data$MasVnrType[is.na(all_data$MasVnrType)] <- "None"
+all_data$MasVnrArea[is.na(all_data$MasVnrArea)] <- 0
+```
+
+**MSZoning (The general zoning classification)**: Since 'RL' is the most common value, we can replace missing values with 'RL'.
+
+```{r}
+# Replace NA values in 'MSZoning' with the most common value (mode)
+all_data$MSZoning[is.na(all_data$MSZoning)] <- names(sort(table(all_data$MSZoning), decreasing = TRUE))[1]
+
+```
+
+**Utilities**: This categorical feature mostly contains "AllPub", with one record labeled "NoSeWa" and two missing values (NA). Since the house with 'NoSeWa' is part of the training set, this feature is unlikely to contribute to predictive modeling. Therefore, we can safely remove it.
+
+```{r}
+# Remove the 'Utilities' column from the dataset
+all_data <- all_data[, !names(all_data) %in% c("Utilities")]
+```
+
+**Functional**: According to the data description, NA indicates a typical function.
+
+```{r}
+# Replace NA values in 'Functional' with "Typ"
+all_data$Functional[is.na(all_data$Functional)] <- "Typ"
+```
+
+**Electrical**: This feature has one missing value. Since the majority of records are 'SBrkr', we can replace the missing value with 'SBrkr'.
+
+```{r}
+# Replace NA values in 'Electrical' with the most common value (mode)
+all_data$Electrical[is.na(all_data$Electrical)] <- names(sort(table(all_data$Electrical), decreasing = TRUE))[1]
+
+```
+
+**KitchenQual**: There is only one missing value, and similar to the Electrical feature, we will replace the missing value with 'TA', as it is the most frequent value.
+
+```{r}
+# Replace NA values in 'KitchenQual' with the most common value (mode)
+all_data$KitchenQual[is.na(all_data$KitchenQual)] <- names(sort(table(all_data$KitchenQual), decreasing = TRUE))[1]
+```
+
+**Exterior1st and Exterior2nd**: Both Exterior1st and Exterior2nd have only one missing value. We will replace these missing values with the most common string for each feature.
+
+```{r}
+# Replace NA values in 'Exterior1st' and 'Exterior2nd' with the most common value (mode)
+all_data$Exterior1st[is.na(all_data$Exterior1st)] <- names(sort(table(all_data$Exterior1st), decreasing = TRUE))[1]
+all_data$Exterior2nd[is.na(all_data$Exterior2nd)] <- names(sort(table(all_data$Exterior2nd), decreasing = TRUE))[1]
+```
+
+**SaleType**: We will replace the missing value with the most frequent value, which is "WD".
+
+```{r}
+# Replace NA values in 'SaleType' with the most common value (mode)
+all_data$SaleType[is.na(all_data$SaleType)] <- names(sort(table(all_data$SaleType), decreasing = TRUE))[1]
+```
+
+**MSSubClass**: NA likely indicates no building class. We can replace the missing values with "None".
+
+```{r}
+# Replace NA values in 'MSSubClass' with "None"
+all_data$MSSubClass[is.na(all_data$MSSubClass)] <- "None"
+```
+
+**Checking if there are any missing value**
+
+```{r}
+# Calculate the percentage of missing values for each column
+all_data_na <- colSums(is.na(all_data)) / nrow(all_data) * 100
+
+# Filter columns with missing values and sort them in descending order
+all_data_na <- sort(all_data_na[all_data_na > 0], decreasing = TRUE)
+
+# Create a dataframe to display the missing ratio
+missing_data <- data.frame(Missing_Ratio = all_data_na)
+
+# Display the top rows of the missing data
+head(missing_data)
+
+```
+
+
+**Transforming certain numerical variables that are actually categorical.**
+
+```{r}
+# MSSubClass = The building class
+all_data$MSSubClass <- as.character(all_data$MSSubClass)
+
+# Changing OverallCond into a categorical variable
+all_data$OverallCond <- as.factor(all_data$OverallCond)
+
+# Year and month sold are transformed into categorical features
+all_data$YrSold <- as.factor(all_data$YrSold)
+all_data$MoSold <- as.factor(all_data$MoSold)
+```
+
+**Label encoding certain categorical variables that may have meaningful order or hierarchy.**
+
+```{r}
+# List of columns to apply label encoding
+cols <- c('FireplaceQu', 'BsmtQual', 'BsmtCond', 'GarageQual', 'GarageCond', 
+          'ExterQual', 'ExterCond', 'HeatingQC', 'PoolQC', 'KitchenQual', 'BsmtFinType1', 
+          'BsmtFinType2', 'Functional', 'Fence', 'BsmtExposure', 'GarageFinish', 'LandSlope',
+          'LotShape', 'PavedDrive', 'Street', 'Alley', 'CentralAir', 'MSSubClass', 'OverallCond', 
+          'YrSold', 'MoSold')
+
+# Apply label encoding to categorical columns
+for (col in cols) {
+  all_data[[col]] <- as.integer(factor(all_data[[col]]))
+}
+
+# Display the shape of the dataset
+cat("Shape of all_data:", dim(all_data), "\n")
+
+```
+
+**Adding another crucial feature**
+
+Since area-related features play a significant role in determining house prices, we are adding a new feature that represents the total area, which is the sum of the basement area, first floor area, and second floor area for each house.
+
+```{r}
+# Adding total square footage feature
+all_data$TotalSF <- all_data$TotalBsmtSF + all_data$`X1stFlrSF` + all_data$`X2ndFlrSF`
+```
+
+**Skewed features**
+
+```{r}
+# Load necessary library
+library(e1071)
+
+# Select only numeric columns
+numeric_feats <- sapply(all_data, is.numeric)
+
+# Calculate skewness for each numeric feature
+skewed_feats <- sapply(all_data[, numeric_feats], function(x) skewness(x, na.rm = TRUE))
+
+# Sort the skewness values in descending order
+skewed_feats <- sort(skewed_feats, decreasing = TRUE)
+
+# Create a data frame to display skewness values
+skewness <- data.frame(Skew = skewed_feats)
+
+# Display the top 10 skewed features
+head(skewness, 10)
+
+```
+
+**Box-Cox Transformation for (Highly) Skewed Features:** We use the boxcox function from the MASS package to perform the Box-Cox transformation. For data where x + 1 is required, we apply the boxcox function with the parameter lambda to perform the transformation.
+
+Setting $\lambda$ = 0
+
+```{r}
+# Calculate skewness for numeric features (assumes skewness variable is already calculated)
+skewness <- skewness[abs(skewness) > 0.75]
+cat("There are", length(skewness), "skewed numerical features to Box-Cox transform\n")
+
+# Specify the skewed features and lambda
+skewed_features <- names(skewness)
+lam <- 0.15
+
+# Apply Box-Cox transformation to skewed features
+for (feat in skewed_features) {
+  all_data[[feat]] <- boxcox(all_data[[feat]] + 1, lambda = lam)$y
+}
+```
+
+**Creating dummy variables for categorical features**
+
+```{r}
+# Create dummy variables for categorical features
+all_data <- model.matrix(~ . - 1, data = all_data)
+
+# Check the dimensions of the transformed dataset
+cat("Shape of all_data:", dim(all_data), "\n")
+
+```
+
+**Creating the new training and testing datasets**
+
+```{r}
+# Create the new train and test sets
+train <- all_data[1:ntrain, ]
+test <- all_data[(ntrain + 1):nrow(all_data), ]
+```
+
+```{r}
+class(train)
+class(y_train)
+class(test)
+```
+
+## Modelling
+
+After data cleaning and feature engineering, we found that the data has a certain level of complexity. For example, some features exhibit strong correlations, and the feature types are diverse, including numerical, categorical, and ordinal data.
+
+Therefore, we need to focus on more robust models.
+
+To combine linear and non-linear models, we selected four models with the aim of identifying the best one and leveraging their strengths for optimal prediction results. First, we chose LASSO because it helps reduce the impact of irrelevant features. Next, we chose Random Forest, as it is a powerful non-linear model capable of handling complex relationships between features. Then, we selected GBR, which excels at capturing intricate relationships between features. Finally, we chose XGBoost because it is well-suited for handling high-dimensional data and has outstanding model performance, further improving prediction accuracy with each optimization.
+
+### Librairies
+
+```{r, message=FALSE, warning=FALSE}
+# Load necessary libraries
+library(glmnet)         # ElasticNet and Lasso
+library(Metrics)        # For Mean Squared Error (MSE)
+library(randomForest)   # For RandomForestRegressor
+library(gbm)            # For GradientBoostingRegressor
+library(kernlab)        # For KernelRidge
+library(caret)          # For model training and cross-validation
+library(xgboost)        # For XGBoost
+library(lightgbm)       # For LightGBM
+library(Metrics)        # For calculating MSE
+library(robustbase)     # For RobustScaler
+
+```
+
+### Base Models
+
+#### Lasso Regression
+
+```{r}
+
+# Convert train and test data matrices to data frames
+train_df <- as.data.frame(train)   # Convert train to data frame
+test_df <- as.data.frame(test)     # Convert test to data frame
+
+# Ensure y_train is a vector and not a matrix/array
+y_train_df <- as.vector(y_train)  # Convert y_train to a vector
+
+# Perform scaling on train and test data consistently
+train_scaled_df <- scale(train_df)  # Scaling the training data
+test_scaled_df <- scale(test_df, center = attr(train_scaled_df, "scaled:center"), scale = attr(train_scaled_df, "scaled:scale"))  # Use the same scaling as the training set
+
+# Fit the Lasso regression model using glmnet
+lasso_model <- glmnet(train_scaled_df, y_train_df, alpha = 1, lambda = 0.0005)
+
+# View the model results
+print(lasso_model)
+
+# Perform cross-validation with glmnet to select the optimal lambda
+cv_lasso_model <- cv.glmnet(train_scaled_df, y_train_df, alpha = 1)
+
+# View the results from cross-validation
+print(cv_lasso_model)
+
+# Make predictions on the test data
+predictions_lasso <- predict(cv_lasso_model, newx = test_scaled_df, s = "lambda.min")
+
+
+```
+
+#### Random Forest
+
+```{r, message=FALSE, warning=FALSE}
+# Clean column names by removing special characters or spaces
+colnames(train) <- gsub("[^[:alnum:]_]", "", colnames(train))
+colnames(test) <- gsub("[^[:alnum:]_]", "", colnames(test))
+```
+
+```{r}
+# Convert train and test data matrices to data frames
+train_df <- as.data.frame(train)  # Convert train to data frame
+test_df <- as.data.frame(test)    # Convert test to data frame
+
+# Ensure y_train is a vector and not a matrix/array
+y_train_df <- as.vector(y_train)  # Convert y_train to a vector
+
+# Fit the Random Forest regression model
+rf_model <- randomForest(x = train_df, y = y_train_df, importance = TRUE)
+
+# Print the model summary
+print(rf_model)
+
+# Check the importance of each feature
+importance(rf_model)
+
+# Plot the feature importance
+varImpPlot(rf_model)
+
+# Make predictions on the test dataset
+predictions_rf <- predict(rf_model, newdata = test_df)
+
+```
+
+#### Gradient Boosting Regression
+
+```{r}
+# Set seed
+set.seed(5)
+
+# Convert
+train_df <- as.data.frame(train) 
+y_train_numeric <- as.numeric(y_train)
+test_df <- as.data.frame(test)
+
+# Train the Gradient Boosting Model
+gboost_model <- gbm(
+  formula = y_train_numeric ~ .,               # Use y_train_numeric as target variable (train data without SalePrice)
+  data = train_df,                             # Use train_df as the data (without SalePrice column)
+  distribution = "gaussian",                   # Gaussian for regression (continuous target variable)
+  n.trees = 3000,                              # Number of boosting iterations (n_estimators)
+  interaction.depth = 4,                       # Maximum depth of trees
+  shrinkage = 0.05,                            # Learning rate (shrinkage)
+  n.minobsinnode = 15,                         # Minimum number of samples in a leaf
+  cv.folds = 5,                                # Cross-validation folds for model validation
+  verbose = FALSE                              # No Output progress
+)
+
+# Print
+summary(gboost_model)
+
+# Make predictions on the test set
+predictions_gboost <- predict(gboost_model, test_df, n.trees = 3000)
+
+```
+
+#### XGBoost
+
+```{r}
+# Convert
+train_df_xgb <- as.data.frame(train)  
+test_df_xgb <- as.data.frame(test)    
+
+# Ensure y_train is a vector
+y_train_xgb <- as.vector(y_train)
+
+# Convert the data to matrix format for XGBoost
+train_matrix <- as.matrix(train_df_xgb)
+test_matrix <- as.matrix(test_df_xgb)
+
+# Convert target variable into a matrix as required by XGBoost
+y_train_matrix <- as.matrix(y_train_xgb)
+
+# Train the XGBoost model
+xgb_model <- xgboost(
+  data = train_matrix,                  # Training data in matrix format
+  label = y_train_matrix,               # Target variable (label) in matrix format
+  objective = "reg:squarederror",       # Objective for regression (mean squared error)
+  nrounds = 1000,                       # Number of boosting iterations (n_estimators)
+  max_depth = 4,                        # Maximum depth of trees
+  eta = 0.05,                           # Learning rate (shrinkage)
+  min_child_weight = 15,                # Minimum number of samples in a leaf
+  subsample = 0.8,                      # Subsample ratio of the training data
+  colsample_bytree = 0.8,               # Subsample ratio of features for each tree
+  verbose = 0                           # No output progress
+)
+
+# Print
+print(xgb_model)
+
+# Make predictions on the test set
+predictions_xgb <- predict(xgb_model, test_matrix)
+
+```
+
+### Base models scores
+
+**LASsO**
+
+```{r}
+# Apply log1p transformation to predictions and y_test for RMSLE calculation
+y_test_log <- log1p(y_test)  # Ensure we are using y_test (actual SalePrice from test data)
+predictions_lasso_log <- log1p(predictions_lasso)
+
+# Calculate RMSLE score
+rmsle_score <- sqrt(mean((y_test_log - predictions_lasso_log)^2))
+cat("Lasso model RMSLE score: ", round(rmsle_score, 4), "\n")
+```
+
+**Random Forest**
+
+```{r}
+# Apply log1p transformation to predictions and y_test for RMSLE calculation
+y_test_log <- log1p(y_test)  # Ensure we are using y_test (actual SalePrice from test data)
+predictions_rf_log <- log1p(predictions_rf)
+
+# Calculate RMSLE score
+rmsle_score_rf <- sqrt(mean((y_test_log - predictions_rf_log)^2))
+cat("Random Forest model RMSLE score: ", round(rmsle_score_rf, 4), "\n")
+
+```
+
+**Gradient Boosting Regression**
+
+```{r}
+# Convert
+y_test_df <- as.data.frame(y_test)
+
+# Apply log1p transformation
+y_test_log <- log1p(y_test_df[[1]])
+
+# Apply log1p transformation to the predictions
+predictions_gboost_log <- log1p(predictions_gboost)  # Log transform the predictions
+
+# Calculate RMSLE score
+rmsle_score <- sqrt(mean((y_test_log - predictions_gboost_log)^2))
+cat("Gradient Boosting model RMSLE score: ", round(rmsle_score, 4), "\n")
+
+```
+
+**XGBoost**
+
+```{r}
+# Apply log1p transformation to predictions and y_test for RMSLE calculation
+y_test_log_xgb <- log1p(y_test)  # Ensure we are using y_test (actual SalePrice from test data)
+predictions_xgb_log <- log1p(predictions_xgb)
+
+# Calculate RMSLE score
+rmsle_score_xgb <- sqrt(mean((y_test_log_xgb - predictions_xgb_log)^2))
+cat("XGBoost model RMSLE score: ", round(rmsle_score_xgb, 4), "\n")
+```
+
+We could also check the $R^{2}$ for each model, to see if they give a good predictions result or not.
+
+```{r}
+# Calculate R-squared for each model
+rsq_lasso <- 1 - sum((y_test - predictions_lasso)^2) / sum((y_test - mean(y_test))^2)
+rsq_rf <- 1 - sum((y_test - predictions_rf)^2) / sum((y_test - mean(y_test))^2)
+rsq_gboost <- 1 - sum((y_test - predictions_gboost)^2) / sum((y_test - mean(y_test))^2)
+rsq_xgb <- 1 - sum((y_test - predictions_xgb)^2) / sum((y_test - mean(y_test))^2)
+
+# Create a data frame for the R-squared values
+model_names <- c("Lasso", "Random Forest", "Gradient Boosting", "XGBoost")
+rsq_values <- c(rsq_lasso, rsq_rf, rsq_gboost, rsq_xgb)
+
+rsq_df <- data.frame(Model = model_names, R_Squared = rsq_values)
+
+# Plot the R-squared values
+library(ggplot2)
+
+ggplot(rsq_df, aes(x = Model, y = R_Squared, fill = Model)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = round(R_Squared, 3)), vjust = -0.5, size = 5) + 
+  theme_minimal() +
+  labs(title = "R-squared for Different Models", x = "Model", y = "R-squared") +
+  theme(legend.position = "none")
+```
+
+These R-squared values indicate that all models have strong predictive performance, with R-squared values close to 1, suggesting that they explain a high proportion of the variance in the target variable, SalePrice.
+
+## Evaluation
+
+```{r}
+# Plot Predicted vs Actual SalePrice (for XGBoost model)
+plot_df <- data.frame(
+  Actual = y_test,
+  Predicted = predictions_xgb
+)
+
+ggplot(plot_df, aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "Predicted vs Actual Sale Prices (XGBoost)",
+       x = "Actual Sale Price",
+       y = "Predicted Sale Price")
+
+# Plot residuals
+plot_df$Residuals <- plot_df$Actual - plot_df$Predicted
+ggplot(plot_df, aes(x = Predicted, y = Residuals)) +
+  geom_point(alpha = 0.5, color = "darkorange") +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "Residual Plot (XGBoost Model)",
+       x = "Predicted Price",
+       y = "Residuals (Actual - Predicted)")
+
+```
+
+## Important varaible
+
+```{r}
+# Get feature importance from XGBoost
+importance_matrix <- xgb.importance(model = xgb_model)
+head(importance_matrix, 10)
+
+```
+
+
